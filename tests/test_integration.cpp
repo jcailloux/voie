@@ -24,44 +24,6 @@ static uint16_t alloc_port() {
     return next_port.fetch_add(1);
 }
 
-// Wait until the server actually responds to an HTTP request (not just TCP connect).
-// A TCP connect only proves the listen socket is bound; the io_uring accept loop
-// might not be running yet.
-static bool wait_for_server(uint16_t port, int max_ms = 3000) {
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-            ::close(fd);
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
-        }
-
-        // Send a probe request and wait for any response
-        struct timeval tv{};
-        tv.tv_sec = 1;
-        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        const char probe[] = "GET /__probe HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        if (::send(fd, probe, sizeof(probe) - 1, MSG_NOSIGNAL) > 0) {
-            char buf[512];
-            ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-            ::close(fd);
-            if (n > 0) return true;  // server responded — it's ready
-        } else {
-            ::close(fd);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return false;
-}
 
 static void wake_loops(uint16_t port, int count = 10) {
     for (int i = 0; i < count; ++i) {
@@ -97,18 +59,29 @@ static http_response read_response(int fd) {
         resp.raw.append(buf, static_cast<std::size_t>(n));
     }
 
-    // Parse status
+    // Parse status (manually — avoid stoi exceptions on corrupted data)
     if (resp.raw.size() >= 12) {
-        resp.status = std::stoi(resp.raw.substr(9, 3));
+        int s = 0;
+        bool valid = true;
+        for (int i = 9; i < 12; ++i) {
+            if (resp.raw[i] < '0' || resp.raw[i] > '9') { valid = false; break; }
+            s = s * 10 + (resp.raw[i] - '0');
+        }
+        if (valid) resp.status = s;
     }
 
-    // Find Content-Length
+    // Find Content-Length (manually — avoid stoull exceptions)
     std::size_t content_length = 0;
     auto cl_pos = resp.raw.find("Content-Length: ");
     if (cl_pos != std::string::npos) {
         auto val_start = cl_pos + 16;
         auto val_end = resp.raw.find("\r\n", val_start);
-        content_length = std::stoull(resp.raw.substr(val_start, val_end - val_start));
+        if (val_end != std::string::npos) {
+            for (auto i = val_start; i < val_end; ++i) {
+                if (resp.raw[i] < '0' || resp.raw[i] > '9') break;
+                content_length = content_length * 10 + static_cast<std::size_t>(resp.raw[i] - '0');
+            }
+        }
     }
 
     // Calculate how much body we already have
@@ -161,6 +134,15 @@ static http_response http_get(uint16_t port, const std::string& path) {
     return resp;
 }
 
+// One-shot: connect, send raw request, read response, close.
+static http_response send_raw(uint16_t port, const std::string& request) {
+    int fd = connect_to(port);
+    if (fd < 0) return {};
+    auto resp = send_request(fd, request);
+    ::close(fd);
+    return resp;
+}
+
 // RAII server: starts in constructor, stops in destructor.
 struct test_server {
     voie::app app;
@@ -173,7 +155,7 @@ struct test_server {
 
     void start() {
         thread = std::thread([this]() { app.listen(port); });
-        REQUIRE(wait_for_server(port));
+        REQUIRE(app.wait_ready());
     }
 
     ~test_server() {
@@ -273,11 +255,8 @@ TEST_CASE("integration: different HTTP methods", "[integration]") {
 
     REQUIRE(http_get(port, "/res").body == "got");
 
-    int fd = connect_to(port);
-    REQUIRE(fd >= 0);
-    auto resp = send_request(fd,
+    auto resp = send_raw(port,
         "POST /res HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
-    ::close(fd);
     REQUIRE(resp.body == "posted");
 }
 
@@ -348,11 +327,8 @@ TEST_CASE("integration: middleware short-circuit", "[integration]") {
     REQUIRE(resp1.status == 401);
 
     // With auth → 200
-    int fd = connect_to(port);
-    REQUIRE(fd >= 0);
-    auto resp2 = send_request(fd,
+    auto resp2 = send_raw(port,
         "GET /guarded HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tok\r\n\r\n");
-    ::close(fd);
     REQUIRE(resp2.status == 200);
     REQUIRE(resp2.body == "secret");
 }
@@ -425,10 +401,7 @@ TEST_CASE("integration: malformed request gets 400", "[integration]") {
     srv.app.get("/", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
-    int fd = connect_to(port);
-    REQUIRE(fd >= 0);
-    auto resp = send_request(fd, "INVALID\r\n\r\n");
-    ::close(fd);
+    auto resp = send_raw(port, "INVALID\r\n\r\n");
     REQUIRE(resp.status == 400);
 }
 
@@ -534,13 +507,10 @@ TEST_CASE("integration: POST with body echo", "[integration]") {
     });
     srv.start();
 
-    int fd = connect_to(port);
-    REQUIRE(fd >= 0);
     std::string body = "hello from client";
     std::string req = "POST /echo HTTP/1.1\r\nHost: localhost\r\n"
                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
-    auto resp = send_request(fd, req);
-    ::close(fd);
+    auto resp = send_raw(port, req);
     REQUIRE(resp.status == 200);
     REQUIRE(resp.body == body);
 }
@@ -597,4 +567,96 @@ TEST_CASE("integration: custom response headers", "[integration]") {
     REQUIRE(resp.status == 200);
     REQUIRE(resp.raw.find("X-Custom: myvalue") != std::string::npos);
     REQUIRE(resp.raw.find("X-Request-Id: abc-123") != std::string::npos);
+}
+
+// ============================================================================
+// app.all() — registers for all HTTP methods
+// ============================================================================
+
+TEST_CASE("integration: all() responds to multiple methods", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.all("/any", [](voie::ctx& c) {
+        std::string body = "method:";
+        body += c.method();
+        c.text(body);
+    });
+    srv.start();
+
+    // GET
+    auto r1 = http_get(port, "/any");
+    REQUIRE(r1.status == 200);
+    REQUIRE(r1.body == "method:GET");
+
+    // POST
+    auto r2 = send_raw(port,
+        "POST /any HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    REQUIRE(r2.status == 200);
+    REQUIRE(r2.body == "method:POST");
+
+    // PUT
+    auto r3 = send_raw(port,
+        "PUT /any HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    REQUIRE(r3.status == 200);
+    REQUIRE(r3.body == "method:PUT");
+
+    // DELETE
+    auto r4 = send_raw(port,
+        "DELETE /any HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    REQUIRE(r4.status == 200);
+    REQUIRE(r4.body == "method:DELETE");
+
+    // PATCH
+    auto r5 = send_raw(port,
+        "PATCH /any HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    REQUIRE(r5.status == 200);
+    REQUIRE(r5.body == "method:PATCH");
+}
+
+// ============================================================================
+// listen(address, port)
+// ============================================================================
+
+TEST_CASE("integration: listen on specific address", "[integration]") {
+    auto port = alloc_port();
+    voie::app app;
+    app.threads(1);
+    app.get("/addr", [](voie::ctx& c) { c.text("bound"); });
+
+    std::thread t([&]() { app.listen("127.0.0.1", port); });
+    REQUIRE(app.wait_ready());
+
+    auto resp = http_get(port, "/addr");
+    REQUIRE(resp.status == 200);
+    REQUIRE(resp.body == "bound");
+
+    app.shutdown();
+    wake_loops(port, 3);
+    t.join();
+}
+
+// ============================================================================
+// max_body() enforcement
+// ============================================================================
+
+TEST_CASE("integration: max_body rejects oversized body", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.max_body(64);
+    srv.app.post("/upload", [](voie::ctx& c) { c.text("ok"); });
+    srv.start();
+
+    // Body within limit
+    std::string small_body(32, 'x');
+    std::string small_req = "POST /upload HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Length: " + std::to_string(small_body.size()) + "\r\n\r\n" + small_body;
+    auto r1 = send_raw(port, small_req);
+    REQUIRE(r1.status == 200);
+
+    // Body exceeding limit
+    std::string big_body(128, 'x');
+    std::string big_req = "POST /upload HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Length: " + std::to_string(big_body.size()) + "\r\n\r\n" + big_body;
+    auto r2 = send_raw(port, big_req);
+    REQUIRE(r2.status == 413);
 }

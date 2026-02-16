@@ -2,6 +2,8 @@
 #include "router.h"
 #include "io_loop.h"
 
+#include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <memory>
@@ -26,6 +28,8 @@ struct app::impl {
     detail::app_config config;
     std::vector<std::unique_ptr<detail::io_loop>> loops;
     std::vector<std::thread> threads;
+    std::atomic<unsigned> ready_count{0};
+    std::atomic<unsigned> total_threads{0};
 };
 
 app::app() : impl_(std::make_unique<impl>()) {}
@@ -94,15 +98,9 @@ void app::listen(std::string_view address, std::uint16_t port) {
     std::fprintf(stderr, "voie: listening on %.*s:%u (%u threads)\n",
                  static_cast<int>(address.size()), address.data(), port, num_threads);
 
-    // For single thread, run on the main thread
-    if (num_threads == 1) {
-        detail::io_loop loop(impl_->group_impl.router, impl_->config,
-                             &impl_->not_found_handler, &impl_->error_handler);
-        loop.run(address, port);
-        return;
-    }
+    impl_->total_threads.store(num_threads, std::memory_order_release);
 
-    // Multi-thread: spawn N threads, each with its own io_loop + listen socket (SO_REUSEPORT)
+    // Create all io_loops (including single-thread — needed for shutdown())
     std::string addr_str{address};
     for (unsigned i = 0; i < num_threads; ++i) {
         impl_->loops.push_back(std::make_unique<detail::io_loop>(
@@ -110,10 +108,19 @@ void app::listen(std::string_view address, std::uint16_t port) {
             &impl_->not_found_handler, &impl_->error_handler));
     }
 
+    if (num_threads == 1) {
+        // Single thread: run on the calling thread
+        impl_->loops[0]->run(addr_str, port, &impl_->ready_count);
+        impl_->loops.clear();
+        return;
+    }
+
+    // Multi-thread: spawn N threads, each with its own listen socket (SO_REUSEPORT)
     for (unsigned i = 0; i < num_threads; ++i) {
         auto* loop = impl_->loops[i].get();
-        impl_->threads.emplace_back([loop, addr_str, port]() {
-            loop->run(addr_str, port);
+        auto* ready = &impl_->ready_count;
+        impl_->threads.emplace_back([loop, addr_str, port, ready]() {
+            loop->run(addr_str, port, ready);
         });
     }
 
@@ -128,6 +135,24 @@ void app::shutdown() {
     for (auto& loop : impl_->loops) {
         loop->stop();
     }
+}
+
+bool app::wait_ready(unsigned timeout_ms) const {
+    auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::milliseconds(timeout_ms);
+
+    // Wait for total_threads to be set (listen() may not have started yet)
+    while (impl_->total_threads.load(std::memory_order_acquire) == 0) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    unsigned expected = impl_->total_threads.load(std::memory_order_acquire);
+    while (impl_->ready_count.load(std::memory_order_acquire) < expected) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
 }
 
 // group non-template methods
@@ -150,9 +175,25 @@ void group::add_route(http_method method, std::string_view pattern,
 void group::add_route_all(std::string_view pattern, std::vector<handler>&& chain) {
     std::string full_pattern = prefix_;
     full_pattern += pattern;
-    // TODO: handler is move-only, so we can only register one method.
-    // For a proper all(), handler needs a clone mechanism.
-    impl_->router.add_route(http_method::GET, full_pattern, std::move(chain));
+
+    // Wrap each handler in shared_ptr so we can create cloned chains per method
+    std::vector<std::shared_ptr<handler>> shared;
+    shared.reserve(chain.size());
+    for (auto& h : chain)
+        shared.push_back(std::make_shared<handler>(std::move(h)));
+
+    constexpr http_method methods[] = {
+        http_method::GET, http_method::POST, http_method::PUT,
+        http_method::DELETE, http_method::PATCH, http_method::HEAD,
+        http_method::OPTIONS
+    };
+    for (auto m : methods) {
+        std::vector<handler> clone;
+        clone.reserve(shared.size());
+        for (auto& sp : shared)
+            clone.emplace_back([sp](ctx& c) { (*sp)(c); });
+        impl_->router.add_route(m, full_pattern, std::move(clone));
+    }
 }
 
 } // namespace voie

@@ -80,9 +80,10 @@ app.post("/path",   handler);
 app.put("/path",    handler);
 app.del("/path",    handler);   // DELETE
 app.patch("/path",  handler);
+app.all("/path",    handler);   // All methods
 ```
 
-Path parameters use `:name` syntax. Wildcards use `*`:
+Path parameters use `:name` syntax. Wildcards use `*name`:
 
 ```cpp
 app.get("/users/:id", [](voie::ctx& c) {
@@ -90,8 +91,8 @@ app.get("/users/:id", [](voie::ctx& c) {
     // ...
 });
 
-app.get("/static/*", [](voie::ctx& c) {
-    auto path = c.param("*");
+app.get("/static/*filepath", [](voie::ctx& c) {
+    auto path = c.param("filepath");
     // ...
 });
 ```
@@ -112,7 +113,13 @@ c.path()                // "/users/42"
 c.param("id")           // Path parameter
 c.query("page")         // Query string parameter
 c.header("Authorization")
+c.has_header("X-Custom") // true if header exists
 c.body()                // Request body
+
+// Iterate over all request headers
+for (std::size_t i = 0; i < c.request_header_count(); ++i) {
+    auto [name, value] = c.request_header_at(i);
+}
 ```
 
 **Response building (chainable):**
@@ -128,6 +135,7 @@ c.text("hello");                     // text/plain
 c.json(R"({"ok": true})");          // application/json
 c.html("<h1>hello</h1>");           // text/html
 c.send(data, "image/png");          // custom content type
+c.no_content();                      // 204 No Content
 c.redirect("/login");               // 302 redirect
 c.redirect("/new-url", 301);        // permanent redirect
 ```
@@ -200,6 +208,24 @@ app.on_error([](voie::ctx& c, std::exception_ptr ep) {
 });
 ```
 
+### Lifecycle
+
+```cpp
+// Listen on all interfaces
+app.listen(8080);
+
+// Listen on a specific address
+app.listen("127.0.0.1", 8080);
+
+// For programmatic use (e.g., tests), run in a thread and wait for readiness
+std::thread t([&]() { app.listen(8080); });
+app.wait_ready();  // blocks until all worker threads are initialized
+
+// Graceful shutdown (from another thread or signal handler)
+app.shutdown();
+t.join();
+```
+
 ## Performance
 
 ### Architecture
@@ -264,7 +290,7 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-Test suites: router, arena allocator, HTTP parser, context.
+Test suites: router, arena, HTTP parser, context, handler, security, integration, RFC compliance.
 
 ## License
 

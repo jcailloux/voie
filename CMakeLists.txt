@@ -38,7 +38,39 @@ target_link_libraries(voie
 
 target_compile_options(voie PRIVATE
     -Wall -Wextra -Wpedantic
-    -march=native
+)
+
+# -- Install targets --
+include(GNUInstallDirs)
+
+install(TARGETS voie picohttpparser
+    EXPORT voieTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(DIRECTORY include/voie DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT voieTargets
+    FILE voieTargets.cmake
+    NAMESPACE voie::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/voie
+)
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    cmake/voieConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/voieConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/voie
+)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/voieConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/voieConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/voieConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/voie
 )
 
 if(VOIE_BUILD_EXAMPLES)

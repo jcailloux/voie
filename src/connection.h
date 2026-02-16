@@ -2,6 +2,7 @@
 
 #include "arena.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 
@@ -45,8 +46,21 @@ public:
     // Arena
     [[nodiscard]] arena& alloc() noexcept { return arena_; }
 
-    // Reset for keep-alive
-    void reset_for_next_request() noexcept;
+    // Activity timestamp (for idle timeout / Slowloris protection)
+    using clock = std::chrono::steady_clock;
+    void touch() noexcept { last_activity_ = clock::now(); }
+    [[nodiscard]] clock::time_point last_activity() const noexcept { return last_activity_; }
+
+    // Request consumption tracking (for pipelining)
+    void set_consumed(std::size_t n) noexcept { last_request_consumed_ = n; }
+    [[nodiscard]] std::size_t last_consumed() const noexcept { return last_request_consumed_; }
+
+    // Connection close flag (Connection: close / HTTP/1.0)
+    void set_close_after_send(bool v) noexcept { close_after_send_ = v; }
+    [[nodiscard]] bool should_close() const noexcept { return close_after_send_; }
+
+    // Reset for keep-alive, preserving any pipelined data after consumed_bytes
+    void reset_for_next_request(std::size_t consumed_bytes) noexcept;
 
 private:
     int fd_ = -1;
@@ -59,6 +73,10 @@ private:
     const char* send_buf_ = nullptr;
     std::size_t send_len_ = 0;
     std::size_t send_offset_ = 0;
+
+    clock::time_point last_activity_{};
+    std::size_t last_request_consumed_ = 0;
+    bool close_after_send_ = false;
 };
 
 } // namespace voie::detail

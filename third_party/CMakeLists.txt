@@ -9,8 +9,8 @@
 add_library(picohttpparser STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/picohttpparser/picohttpparser.c
 )
-target_include_directories(picohttpparser PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/picohttpparser
+target_include_directories(picohttpparser SYSTEM PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/picohttpparser>
 )
 target_compile_options(picohttpparser PRIVATE -march=native)
 

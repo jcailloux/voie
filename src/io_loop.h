@@ -6,7 +6,9 @@
 
 #include <voie/handler.h>
 
+#include <atomic>
 #include <cstdint>
+#include <ctime>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -16,6 +18,8 @@
 struct io_uring;
 
 namespace voie::detail {
+
+struct parsed_request;
 
 enum class sqpoll_mode : std::uint8_t {
     off,  // default — SQPOLL disabled
@@ -27,6 +31,7 @@ struct app_config {
     std::size_t max_body_size = 1 << 20;
     int listen_backlog = 512;
     sqpoll_mode sqpoll = sqpoll_mode::off;
+    unsigned idle_timeout_secs = 60;
 };
 
 class io_loop {
@@ -39,7 +44,8 @@ public:
     io_loop(const io_loop&) = delete;
     io_loop& operator=(const io_loop&) = delete;
 
-    void run(std::string_view address, std::uint16_t port);
+    void run(std::string_view address, std::uint16_t port,
+             std::atomic<unsigned>* ready_signal = nullptr);
     void stop() noexcept;
 
 private:
@@ -48,6 +54,7 @@ private:
         recv,
         send,
         close,
+        timeout,
     };
 
     struct event_data {
@@ -60,6 +67,7 @@ private:
     void submit_recv(std::uint32_t conn_id);
     void submit_send(std::uint32_t conn_id);
     void submit_close(std::uint32_t conn_id);
+    void submit_timeout();
 
     void handle_accept(int res, unsigned cqe_flags);
     void handle_recv(std::uint32_t conn_id, int res);
@@ -68,6 +76,17 @@ private:
     void process_request(std::uint32_t conn_id);
     void build_response(connection& conn, ctx& c);
     void send_error_response(std::uint32_t conn_id, int status, std::string_view body);
+    void sweep_idle_connections();
+
+    // Date header cache (per-second)
+    void update_date_cache();
+    [[nodiscard]] std::string_view cached_date() noexcept;
+    char date_buf_[32]{};
+    std::size_t date_len_ = 0;
+    std::time_t last_date_update_ = 0;
+
+    // Connection: close / HTTP/1.0 detection
+    static bool should_close_connection(const parsed_request& req);
 
     const router& router_;
     const app_config& config_;
@@ -83,7 +102,9 @@ private:
     std::unique_ptr<std::optional<connection>[]> connections_;
     std::vector<std::uint32_t> free_list_;
 
-    // Event data storage (one per connection + one for accept)
+    // Event data storage (one per connection + accept + timeout)
+    static constexpr std::uint32_t ACCEPT_EVENT_ID = max_connections;
+    static constexpr std::uint32_t TIMEOUT_EVENT_ID = max_connections + 1;
     std::unique_ptr<event_data[]> event_store_;
 
     std::uint32_t alloc_conn_id();

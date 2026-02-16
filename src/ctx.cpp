@@ -9,6 +9,45 @@
 
 namespace voie {
 
+// --- Header validation helpers ---
+
+static bool is_valid_header_name(std::string_view name) noexcept {
+    if (name.empty()) return false;
+    for (char c : name) {
+        // RFC 7230 token characters
+        if (c <= 0x20 || c >= 0x7f) return false;
+        switch (c) {
+            case '(': case ')': case '<': case '>': case '@':
+            case ',': case ';': case ':': case '\\': case '"':
+            case '/': case '[': case ']': case '?': case '=':
+            case '{': case '}':
+                return false;
+            default: break;
+        }
+    }
+    return true;
+}
+
+static bool is_valid_header_value(std::string_view value) noexcept {
+    for (char c : value) {
+        if (c == '\r' || c == '\n' || c == '\0') return false;
+    }
+    return true;
+}
+
+static bool header_name_eq(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// --- ctx implementation ---
+
 ctx::ctx(detail::connection& conn,
          const detail::parsed_request& req,
          const detail::route_match& match)
@@ -34,8 +73,7 @@ std::string_view ctx::param(std::string_view name) const noexcept {
     return {};
 }
 
-std::string_view ctx::query(std::string_view name) const noexcept {
-    // Parse query string lazily from req_.query
+std::string_view ctx::query(std::string_view name) noexcept {
     std::string_view qs = req_.query;
     while (!qs.empty()) {
         auto amp = qs.find('&');
@@ -43,7 +81,15 @@ std::string_view ctx::query(std::string_view name) const noexcept {
         auto eq = pair.find('=');
         std::string_view key = pair.substr(0, eq);
         if (key == name) {
-            return eq != std::string_view::npos ? pair.substr(eq + 1) : std::string_view{};
+            if (eq == std::string_view::npos) return {};
+            auto raw_value = pair.substr(eq + 1);
+            if (raw_value.empty()) return raw_value;
+            // URL-decode the value into arena
+            auto& a = conn_.alloc();
+            char* buf = static_cast<char*>(a.alloc(raw_value.size(), 1));
+            std::memcpy(buf, raw_value.data(), raw_value.size());
+            std::size_t decoded_len = detail::url_decode_inplace(buf, raw_value.size());
+            return {buf, decoded_len};
         }
         qs = amp != std::string_view::npos ? qs.substr(amp + 1) : std::string_view{};
     }
@@ -53,26 +99,38 @@ std::string_view ctx::query(std::string_view name) const noexcept {
 std::string_view ctx::header(std::string_view name) const noexcept {
     for (std::size_t i = 0; i < req_.num_headers; ++i) {
         std::string_view hdr_name{req_.headers[i].name, req_.headers[i].name_len};
-        // Case-insensitive comparison
-        if (hdr_name.size() == name.size()) {
-            bool match = true;
-            for (std::size_t j = 0; j < name.size(); ++j) {
-                char a = hdr_name[j];
-                char b = name[j];
-                if (a >= 'A' && a <= 'Z') a += 32;
-                if (b >= 'A' && b <= 'Z') b += 32;
-                if (a != b) { match = false; break; }
-            }
-            if (match) {
-                return {req_.headers[i].value, req_.headers[i].value_len};
-            }
+        if (header_name_eq(hdr_name, name)) {
+            return {req_.headers[i].value, req_.headers[i].value_len};
         }
     }
     return {};
 }
 
+bool ctx::has_header(std::string_view name) const noexcept {
+    for (std::size_t i = 0; i < req_.num_headers; ++i) {
+        std::string_view hdr_name{req_.headers[i].name, req_.headers[i].name_len};
+        if (header_name_eq(hdr_name, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string_view ctx::body() const noexcept {
     return req_.body;
+}
+
+std::size_t ctx::request_header_count() const noexcept {
+    return req_.num_headers;
+}
+
+std::pair<std::string_view, std::string_view>
+ctx::request_header_at(std::size_t index) const noexcept {
+    if (index >= req_.num_headers) return {{}, {}};
+    return {
+        {req_.headers[index].name, req_.headers[index].name_len},
+        {req_.headers[index].value, req_.headers[index].value_len}
+    };
 }
 
 ctx& ctx::status(int code) noexcept {
@@ -81,6 +139,19 @@ ctx& ctx::status(int code) noexcept {
 }
 
 ctx& ctx::set(std::string_view name, std::string_view value) {
+    if (!is_valid_header_name(name) || !is_valid_header_value(value)) {
+        return *this;
+    }
+
+    // Overwrite if header name already exists (case-insensitive)
+    for (std::uint8_t i = 0; i < resp_header_count_; ++i) {
+        if (header_name_eq(resp_headers_[i].name, name)) {
+            auto& a = conn_.alloc();
+            resp_headers_[i].value = a.dup(value);
+            return *this;
+        }
+    }
+
     if (resp_header_count_ < max_resp_headers_) {
         auto& a = conn_.alloc();
         resp_headers_[resp_header_count_++] = {a.dup(name), a.dup(value)};
@@ -104,7 +175,27 @@ void ctx::send(std::string_view body, std::string_view content_type) {
     if (response_sent_) return;
     auto& a = conn_.alloc();
     resp_body_ = a.dup(body);
-    resp_content_type_ = a.dup(content_type);
+
+    // Append charset for text/* types if not already present
+    if (content_type.starts_with("text/") &&
+        content_type.find("charset") == std::string_view::npos) {
+        std::size_t new_len = content_type.size() + 15; // "; charset=utf-8"
+        char* buf = static_cast<char*>(a.alloc(new_len, 1));
+        std::memcpy(buf, content_type.data(), content_type.size());
+        std::memcpy(buf + content_type.size(), "; charset=utf-8", 15);
+        resp_content_type_ = std::string_view{buf, new_len};
+    } else {
+        resp_content_type_ = a.dup(content_type);
+    }
+
+    response_sent_ = true;
+}
+
+void ctx::no_content() {
+    if (response_sent_) return;
+    status_code_ = 204;
+    resp_body_ = {};
+    resp_content_type_ = {};
     response_sent_ = true;
 }
 

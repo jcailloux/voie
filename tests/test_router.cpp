@@ -306,3 +306,42 @@ TEST_CASE("router: method isolation — GET does not match POST", "[router]") {
     REQUIRE(!r.lookup(http_method::DELETE, "/only-get").has_value());
     REQUIRE(!r.lookup(http_method::PATCH, "/only-get").has_value());
 }
+
+// ============================================================================
+// methods_for_path()
+// ============================================================================
+
+TEST_CASE("router: methods_for_path multi-method", "[router]") {
+    router r;
+    r.add_route(http_method::GET, "/foo", make_chain());
+    r.add_route(http_method::POST, "/foo", make_chain());
+    r.freeze();
+
+    auto mask = r.methods_for_path("/foo");
+    REQUIRE((mask & (1u << static_cast<int>(http_method::GET))) != 0);
+    REQUIRE((mask & (1u << static_cast<int>(http_method::POST))) != 0);
+    REQUIRE((mask & (1u << static_cast<int>(http_method::DELETE))) == 0);
+}
+
+TEST_CASE("router: methods_for_path nonexistent path", "[router]") {
+    router r;
+    r.add_route(http_method::GET, "/exists", make_chain());
+    r.freeze();
+
+    REQUIRE(r.methods_for_path("/nonexistent") == 0);
+}
+
+TEST_CASE("router: methods_for_path all registered methods", "[router]") {
+    router r;
+    r.add_route(http_method::GET, "/res", make_chain());
+    r.add_route(http_method::PUT, "/res", make_chain());
+    r.add_route(http_method::DELETE, "/res", make_chain());
+    r.freeze();
+
+    auto mask = r.methods_for_path("/res");
+    REQUIRE((mask & (1u << static_cast<int>(http_method::GET))) != 0);
+    REQUIRE((mask & (1u << static_cast<int>(http_method::PUT))) != 0);
+    REQUIRE((mask & (1u << static_cast<int>(http_method::DELETE))) != 0);
+    REQUIRE((mask & (1u << static_cast<int>(http_method::POST))) == 0);
+    REQUIRE((mask & (1u << static_cast<int>(http_method::PATCH))) == 0);
+}

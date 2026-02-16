@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string_view>
+#include <utility>
 
 namespace voie {
 
@@ -21,9 +22,15 @@ public:
     [[nodiscard]] std::string_view method() const noexcept;
     [[nodiscard]] std::string_view path() const noexcept;
     [[nodiscard]] std::string_view param(std::string_view name) const noexcept;
-    [[nodiscard]] std::string_view query(std::string_view name) const noexcept;
+    [[nodiscard]] std::string_view query(std::string_view name) noexcept;
     [[nodiscard]] std::string_view header(std::string_view name) const noexcept;
+    [[nodiscard]] bool has_header(std::string_view name) const noexcept;
     [[nodiscard]] std::string_view body() const noexcept;
+
+    // -- Request header iteration --
+    [[nodiscard]] std::size_t request_header_count() const noexcept;
+    [[nodiscard]] std::pair<std::string_view, std::string_view>
+        request_header_at(std::size_t index) const noexcept;
 
     // -- Response building (chainable) --
     ctx& status(int code) noexcept;
@@ -34,6 +41,7 @@ public:
     void json(std::string_view body);
     void html(std::string_view body);
     void send(std::string_view body, std::string_view content_type);
+    void no_content();
     void redirect(std::string_view location, int code = 302);
 
     // -- Pre-built response (zero-copy, skips build_response) --
@@ -70,6 +78,10 @@ public:
     [[nodiscard]] std::string_view resp_body() const noexcept { return resp_body_; }
     [[nodiscard]] std::string_view resp_content_type() const noexcept { return resp_content_type_; }
 
+    // HEAD request support (set by io_loop when HEAD falls back to GET handler)
+    void mark_head_request() noexcept { head_request_ = true; }
+    [[nodiscard]] bool is_head_request() const noexcept { return head_request_; }
+
     // Internal: construct from connection, parsed request, and route match
     ctx(detail::connection& conn,
         const detail::parsed_request& req,
@@ -84,6 +96,7 @@ private:
     int status_code_ = 200;
     bool response_sent_ = false;
     bool prebuilt_ = false;
+    bool head_request_ = false;
 
     const handler* handler_chain_ = nullptr;
     std::uint8_t handler_count_ = 0;
