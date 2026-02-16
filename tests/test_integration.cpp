@@ -1,0 +1,600 @@
+#include <catch2/catch_test_macros.hpp>
+#include <voie/voie.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+static std::atomic<uint16_t> next_port{19800};
+
+static uint16_t alloc_port() {
+    return next_port.fetch_add(1);
+}
+
+// Wait until the server actually responds to an HTTP request (not just TCP connect).
+// A TCP connect only proves the listen socket is bound; the io_uring accept loop
+// might not be running yet.
+static bool wait_for_server(uint16_t port, int max_ms = 3000) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+            ::close(fd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        // Send a probe request and wait for any response
+        struct timeval tv{};
+        tv.tv_sec = 1;
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        const char probe[] = "GET /__probe HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        if (::send(fd, probe, sizeof(probe) - 1, MSG_NOSIGNAL) > 0) {
+            char buf[512];
+            ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            ::close(fd);
+            if (n > 0) return true;  // server responded — it's ready
+        } else {
+            ::close(fd);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+static void wake_loops(uint16_t port, int count = 10) {
+    for (int i = 0; i < count; ++i) {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) continue;
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        ::close(fd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+// Parsed HTTP response
+struct http_response {
+    int status = 0;
+    std::string raw;      // full raw response
+    std::string body;
+};
+
+// Read exactly one HTTP response from a connected fd.
+// Parses Content-Length to know where the body ends (works with keep-alive).
+static http_response read_response(int fd) {
+    http_response resp;
+    char buf[4096];
+
+    // Read until we have the complete headers (\r\n\r\n)
+    while (resp.raw.find("\r\n\r\n") == std::string::npos) {
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) return resp;
+        resp.raw.append(buf, static_cast<std::size_t>(n));
+    }
+
+    // Parse status
+    if (resp.raw.size() >= 12) {
+        resp.status = std::stoi(resp.raw.substr(9, 3));
+    }
+
+    // Find Content-Length
+    std::size_t content_length = 0;
+    auto cl_pos = resp.raw.find("Content-Length: ");
+    if (cl_pos != std::string::npos) {
+        auto val_start = cl_pos + 16;
+        auto val_end = resp.raw.find("\r\n", val_start);
+        content_length = std::stoull(resp.raw.substr(val_start, val_end - val_start));
+    }
+
+    // Calculate how much body we already have
+    auto hdr_end = resp.raw.find("\r\n\r\n") + 4;
+    std::size_t body_received = resp.raw.size() - hdr_end;
+
+    // Read remaining body bytes
+    while (body_received < content_length) {
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        resp.raw.append(buf, static_cast<std::size_t>(n));
+        body_received += static_cast<std::size_t>(n);
+    }
+
+    resp.body = resp.raw.substr(hdr_end, content_length);
+    return resp;
+}
+
+// Open a TCP connection to localhost:port with a read timeout
+static int connect_to(uint16_t port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return -1;
+    }
+    struct timeval tv{};
+    tv.tv_sec = 2;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return fd;
+}
+
+// Send a request and read one response on an existing connection
+static http_response send_request(int fd, const std::string& request) {
+    ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+    return read_response(fd);
+}
+
+// One-shot: connect, send GET, read response, close.
+static http_response http_get(uint16_t port, const std::string& path) {
+    int fd = connect_to(port);
+    if (fd < 0) return {};
+    std::string req = "GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto resp = send_request(fd, req);
+    ::close(fd);
+    return resp;
+}
+
+// RAII server: starts in constructor, stops in destructor.
+struct test_server {
+    voie::app app;
+    std::thread thread;
+    uint16_t port;
+
+    explicit test_server(uint16_t p) : port(p) {
+        app.threads(2);
+    }
+
+    void start() {
+        thread = std::thread([this]() { app.listen(port); });
+        REQUIRE(wait_for_server(port));
+    }
+
+    ~test_server() {
+        app.shutdown();
+        wake_loops(port);
+        if (thread.joinable()) thread.join();
+    }
+};
+
+// ============================================================================
+// Basic request-response
+// ============================================================================
+
+TEST_CASE("integration: GET text response", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/hello", [](voie::ctx& c) { c.text("hello, world"); });
+    srv.start();
+
+    auto resp = http_get(port, "/hello");
+    REQUIRE(resp.status == 200);
+    REQUIRE(resp.body == "hello, world");
+    REQUIRE(resp.raw.find("text/plain") != std::string::npos);
+}
+
+TEST_CASE("integration: GET json response", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/data", [](voie::ctx& c) { c.json(R"({"ok":true})"); });
+    srv.start();
+
+    auto resp = http_get(port, "/data");
+    REQUIRE(resp.status == 200);
+    REQUIRE(resp.body == R"({"ok":true})");
+    REQUIRE(resp.raw.find("application/json") != std::string::npos);
+}
+
+TEST_CASE("integration: prebuilt response", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/fast", voie::prebuilt("prebuilt!", "text/plain"));
+    srv.start();
+
+    auto resp = http_get(port, "/fast");
+    REQUIRE(resp.status == 200);
+    REQUIRE(resp.body == "prebuilt!");
+}
+
+TEST_CASE("integration: custom status code", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/created", [](voie::ctx& c) { c.status(201).json(R"({"id":1})"); });
+    srv.start();
+
+    auto resp = http_get(port, "/created");
+    REQUIRE(resp.status == 201);
+}
+
+// ============================================================================
+// Routing
+// ============================================================================
+
+TEST_CASE("integration: route parameters", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/users/:id", [](voie::ctx& c) {
+        std::string body = "user:";
+        body += c.param("id");
+        c.text(body);
+    });
+    srv.start();
+
+    auto resp = http_get(port, "/users/42");
+    REQUIRE(resp.status == 200);
+    REQUIRE(resp.body == "user:42");
+}
+
+TEST_CASE("integration: multiple routes", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/a", [](voie::ctx& c) { c.text("A"); });
+    srv.app.get("/b", [](voie::ctx& c) { c.text("B"); });
+    srv.app.get("/c", [](voie::ctx& c) { c.text("C"); });
+    srv.start();
+
+    REQUIRE(http_get(port, "/a").body == "A");
+    REQUIRE(http_get(port, "/b").body == "B");
+    REQUIRE(http_get(port, "/c").body == "C");
+}
+
+TEST_CASE("integration: different HTTP methods", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/res", [](voie::ctx& c) { c.text("got"); });
+    srv.app.post("/res", [](voie::ctx& c) { c.text("posted"); });
+    srv.start();
+
+    REQUIRE(http_get(port, "/res").body == "got");
+
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+    auto resp = send_request(fd,
+        "POST /res HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    ::close(fd);
+    REQUIRE(resp.body == "posted");
+}
+
+// ============================================================================
+// Groups
+// ============================================================================
+
+TEST_CASE("integration: group prefix routing", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    auto api = srv.app.group("/api/v1");
+    api.get("/items", [](voie::ctx& c) { c.json(R"(["a","b"])"); });
+    api.get("/items/:id", [](voie::ctx& c) {
+        std::string body = "item:";
+        body += c.param("id");
+        c.text(body);
+    });
+    srv.start();
+
+    REQUIRE(http_get(port, "/api/v1/items").body == R"(["a","b"])");
+    REQUIRE(http_get(port, "/api/v1/items/7").body == "item:7");
+    REQUIRE(http_get(port, "/api/v1/missing").status == 404);
+}
+
+// ============================================================================
+// Middleware
+// ============================================================================
+
+TEST_CASE("integration: middleware chain", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/chain",
+        [](voie::ctx& c) {
+            c.set("X-Step", "1");
+            c.next();
+        },
+        [](voie::ctx& c) {
+            c.text("chained");
+        }
+    );
+    srv.start();
+
+    auto resp = http_get(port, "/chain");
+    REQUIRE(resp.status == 200);
+    REQUIRE(resp.body == "chained");
+    REQUIRE(resp.raw.find("X-Step: 1") != std::string::npos);
+}
+
+TEST_CASE("integration: middleware short-circuit", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/guarded",
+        [](voie::ctx& c) {
+            if (c.header("Authorization").empty()) {
+                c.status(401).json(R"({"error":"unauthorized"})");
+                return;
+            }
+            c.next();
+        },
+        [](voie::ctx& c) {
+            c.text("secret");
+        }
+    );
+    srv.start();
+
+    // Without auth → 401
+    auto resp1 = http_get(port, "/guarded");
+    REQUIRE(resp1.status == 401);
+
+    // With auth → 200
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+    auto resp2 = send_request(fd,
+        "GET /guarded HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tok\r\n\r\n");
+    ::close(fd);
+    REQUIRE(resp2.status == 200);
+    REQUIRE(resp2.body == "secret");
+}
+
+TEST_CASE("integration: global middleware", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.use([](voie::ctx& c) {
+        c.set("X-Global", "yes");
+        c.next();
+    });
+    srv.app.get("/a", [](voie::ctx& c) { c.text("A"); });
+    srv.app.get("/b", [](voie::ctx& c) { c.text("B"); });
+    srv.start();
+
+    auto resp1 = http_get(port, "/a");
+    REQUIRE(resp1.raw.find("X-Global: yes") != std::string::npos);
+
+    auto resp2 = http_get(port, "/b");
+    REQUIRE(resp2.raw.find("X-Global: yes") != std::string::npos);
+}
+
+// ============================================================================
+// Error handling
+// ============================================================================
+
+TEST_CASE("integration: 404 default", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/exists", [](voie::ctx& c) { c.text("ok"); });
+    srv.start();
+
+    auto resp = http_get(port, "/nope");
+    REQUIRE(resp.status == 404);
+}
+
+TEST_CASE("integration: custom 404 handler", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/exists", [](voie::ctx& c) { c.text("ok"); });
+    srv.app.not_found([](voie::ctx& c) {
+        c.status(404).json(R"({"error":"not found"})");
+    });
+    srv.start();
+
+    auto resp = http_get(port, "/nope");
+    REQUIRE(resp.status == 404);
+    REQUIRE(resp.body.find("not found") != std::string::npos);
+}
+
+TEST_CASE("integration: error handler catches exceptions", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/boom", [](voie::ctx& c) {
+        throw std::runtime_error("test error");
+    });
+    srv.app.on_error([](voie::ctx& c, std::exception_ptr) {
+        c.status(500).json(R"({"error":"caught"})");
+    });
+    srv.start();
+
+    auto resp = http_get(port, "/boom");
+    REQUIRE(resp.status == 500);
+    REQUIRE(resp.body.find("caught") != std::string::npos);
+}
+
+TEST_CASE("integration: malformed request gets 400", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/", [](voie::ctx& c) { c.text("ok"); });
+    srv.start();
+
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+    auto resp = send_request(fd, "INVALID\r\n\r\n");
+    ::close(fd);
+    REQUIRE(resp.status == 400);
+}
+
+// ============================================================================
+// Keep-alive
+// ============================================================================
+
+TEST_CASE("integration: keep-alive multiple requests on one connection", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/ping", [](voie::ctx& c) { c.text("pong"); });
+    srv.start();
+
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
+    for (int i = 0; i < 5; ++i) {
+        auto resp = send_request(fd,
+            "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        REQUIRE(resp.status == 200);
+        REQUIRE(resp.body == "pong");
+    }
+    ::close(fd);
+}
+
+// ============================================================================
+// Concurrency
+// ============================================================================
+
+TEST_CASE("integration: concurrent connections", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/concurrent", [](voie::ctx& c) { c.text("ok"); });
+    srv.start();
+
+    constexpr int N = 20;
+    std::vector<std::thread> threads;
+    std::atomic<int> success_count{0};
+
+    for (int i = 0; i < N; ++i) {
+        threads.emplace_back([port, &success_count]() {
+            // Retry up to 3 times — under high concurrency a connect or
+            // recv can transiently fail (kernel backlog, busy io_uring).
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                auto resp = http_get(port, "/concurrent");
+                if (resp.status == 200 && resp.body == "ok") {
+                    success_count++;
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        });
+    }
+
+    for (auto& t : threads) t.join();
+    REQUIRE(success_count == N);
+}
+
+TEST_CASE("integration: concurrent keep-alive connections", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/ka", [](voie::ctx& c) { c.text("ok"); });
+    srv.start();
+
+    constexpr int CLIENTS = 5;
+    constexpr int REQUESTS_PER_CLIENT = 10;
+    std::vector<std::thread> threads;
+    std::atomic<int> success_count{0};
+
+    for (int i = 0; i < CLIENTS; ++i) {
+        threads.emplace_back([port, &success_count]() {
+            // Retry connect if it transiently fails under concurrency
+            int fd = -1;
+            for (int attempt = 0; attempt < 3 && fd < 0; ++attempt) {
+                fd = connect_to(port);
+                if (fd < 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (fd < 0) return;
+            for (int j = 0; j < REQUESTS_PER_CLIENT; ++j) {
+                auto resp = send_request(fd,
+                    "GET /ka HTTP/1.1\r\nHost: localhost\r\n\r\n");
+                if (resp.status == 200 && resp.body == "ok") {
+                    success_count++;
+                }
+            }
+            ::close(fd);
+        });
+    }
+
+    for (auto& t : threads) t.join();
+    REQUIRE(success_count == CLIENTS * REQUESTS_PER_CLIENT);
+}
+
+// ============================================================================
+// POST with body
+// ============================================================================
+
+TEST_CASE("integration: POST with body echo", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.post("/echo", [](voie::ctx& c) {
+        c.text(c.body());
+    });
+    srv.start();
+
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+    std::string body = "hello from client";
+    std::string req = "POST /echo HTTP/1.1\r\nHost: localhost\r\n"
+                      "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    auto resp = send_request(fd, req);
+    ::close(fd);
+    REQUIRE(resp.status == 200);
+    REQUIRE(resp.body == body);
+}
+
+// ============================================================================
+// Redirect
+// ============================================================================
+
+TEST_CASE("integration: redirect response", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/old", [](voie::ctx& c) { c.redirect("/new", 301); });
+    srv.start();
+
+    auto resp = http_get(port, "/old");
+    REQUIRE(resp.status == 301);
+    REQUIRE(resp.raw.find("Location: /new") != std::string::npos);
+}
+
+// ============================================================================
+// Query string through full stack
+// ============================================================================
+
+TEST_CASE("integration: query string parameters", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/search", [](voie::ctx& c) {
+        std::string result = "q=";
+        result += c.query("q");
+        c.text(result);
+    });
+    srv.start();
+
+    auto resp = http_get(port, "/search?q=hello");
+    REQUIRE(resp.status == 200);
+    REQUIRE(resp.body == "q=hello");
+}
+
+// ============================================================================
+// Custom response headers
+// ============================================================================
+
+TEST_CASE("integration: custom response headers", "[integration]") {
+    auto port = alloc_port();
+    test_server srv(port);
+    srv.app.get("/headers", [](voie::ctx& c) {
+        c.set("X-Custom", "myvalue");
+        c.set("X-Request-Id", "abc-123");
+        c.text("ok");
+    });
+    srv.start();
+
+    auto resp = http_get(port, "/headers");
+    REQUIRE(resp.status == 200);
+    REQUIRE(resp.raw.find("X-Custom: myvalue") != std::string::npos);
+    REQUIRE(resp.raw.find("X-Request-Id: abc-123") != std::string::npos);
+}
