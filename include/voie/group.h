@@ -12,32 +12,68 @@ namespace voie {
 
 class app;
 
-// Middleware stored as copyable function pointer type for group reuse
+/// Copyable middleware type used by groups so that middleware can be
+/// shared across sub-groups.
 using middleware_fn = std::function<void(ctx&)>;
 
+/// A scoped group of routes sharing a common path prefix and middleware.
+///
+/// Groups are obtained from app::group() or group::subgroup().  Routes
+/// registered on a group inherit the group's prefix and middleware stack.
+/// All route-registration methods return `*this` for chaining.
+///
+/// @code
+/// auto api = app.group("/api");
+/// api.use(auth_middleware);
+/// api.get("/users", list_users);
+/// api.get("/users/:id", get_user);
+/// @endcode
 class group {
 public:
+    /// Register a handler chain for GET requests.
+    /// @param pattern  Route pattern (e.g. `"/users/:id"`).
+    /// @param fns      One or more callables `void(ctx&)`.
+    /// @return `*this` for chaining.
     template <typename... Fns>
     group& get(std::string_view pattern, Fns&&... fns);
 
+    /// Register a handler chain for POST requests.
+    /// @copydetails get()
     template <typename... Fns>
     group& post(std::string_view pattern, Fns&&... fns);
 
+    /// Register a handler chain for PUT requests.
+    /// @copydetails get()
     template <typename... Fns>
     group& put(std::string_view pattern, Fns&&... fns);
 
+    /// Register a handler chain for DELETE requests.
+    /// @copydetails get()
     template <typename... Fns>
     group& del(std::string_view pattern, Fns&&... fns);
 
+    /// Register a handler chain for PATCH requests.
+    /// @copydetails get()
     template <typename... Fns>
     group& patch(std::string_view pattern, Fns&&... fns);
 
+    /// Register a handler chain for all seven HTTP methods.
+    /// @copydetails get()
     template <typename... Fns>
     group& all(std::string_view pattern, Fns&&... fns);
 
+    /// Append a middleware to this group.
+    /// The middleware runs before every handler registered on this group
+    /// (and its sub-groups) and must call `ctx::next()` to continue.
+    /// @tparam F  Callable type `void(ctx&)`.
+    /// @return `*this` for chaining.
     template <typename F>
     group& use(F&& mw);
 
+    /// Create a nested sub-group.
+    /// The sub-group inherits this group's prefix and middleware stack.
+    /// @param prefix  Additional path prefix appended to the parent's.
+    /// @return A new group object.
     [[nodiscard]] voie::group subgroup(std::string_view prefix);
 
 private:

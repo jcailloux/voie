@@ -10,13 +10,22 @@ namespace voie {
 
 class ctx;
 
+/// Type-erased, move-only wrapper for request handlers and middleware.
+///
+/// Accepts any callable with signature `void(ctx&)`.  Small callables
+/// (up to 24 bytes, nothrow-movable) are stored inline; larger ones are
+/// heap-allocated.  This keeps the common case (stateless lambdas,
+/// small captures) allocation-free.
 class handler {
 public:
-    using invoke_fn = void(*)(void*, ctx&);
-    using destroy_fn = void(*)(void*);
+    using invoke_fn = void(*)(void*, ctx&);   ///< Pointer to the invoke thunk.
+    using destroy_fn = void(*)(void*);        ///< Pointer to the destroy thunk.
 
+    /// Construct an empty (null) handler.
     handler() noexcept : invoke_{nullptr}, destroy_{nullptr} {}
 
+    /// Construct a handler from any callable `void(ctx&)`.
+    /// @tparam F  Callable type (lambda, function object, etc.).
     template <typename F>
         requires std::is_invocable_v<F, ctx&> && (!std::is_same_v<std::decay_t<F>, handler>)
     handler(F&& f) {
@@ -73,10 +82,13 @@ public:
     handler(const handler&) = delete;
     handler& operator=(const handler&) = delete;
 
+    /// Invoke the wrapped callable.
     void operator()(ctx& c) const {
         invoke_(const_cast<void*>(static_cast<const void*>(buf_)), c);
     }
 
+    /// Test whether this handler holds a callable.
+    /// @return `false` if default-constructed or moved-from.
     explicit operator bool() const noexcept { return invoke_ != nullptr; }
 
 private:
