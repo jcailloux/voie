@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace voie {
@@ -30,7 +31,7 @@ constexpr std::string_view method_to_string(http_method m) noexcept {
     return "";
 }
 
-constexpr http_method string_to_method(std::string_view s) noexcept {
+constexpr std::optional<http_method> string_to_method(std::string_view s) noexcept {
     if (s == "GET")     return http_method::GET;
     if (s == "POST")    return http_method::POST;
     if (s == "PUT")     return http_method::PUT;
@@ -38,7 +39,7 @@ constexpr http_method string_to_method(std::string_view s) noexcept {
     if (s == "PATCH")   return http_method::PATCH;
     if (s == "HEAD")    return http_method::HEAD;
     if (s == "OPTIONS") return http_method::OPTIONS;
-    return http_method::GET;
+    return std::nullopt;
 }
 
 } // namespace voie

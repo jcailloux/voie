@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(URING REQUIRED IMPORTED_TARGET liburing)
+if(NOT TARGET uring)
+    add_library(uring ALIAS PkgConfig::URING)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/voieTargets.cmake")
+check_required_components(voie)

@@ -64,6 +64,9 @@ public:
     // -- Graceful shutdown --
     void shutdown();
 
+    // -- Wait for all threads to be fully initialized --
+    bool wait_ready(unsigned timeout_ms = 5000) const;
+
 private:
     struct impl;
     std::unique_ptr<impl> impl_;

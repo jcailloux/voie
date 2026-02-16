@@ -45,6 +45,11 @@ public:
     std::expected<route_match, std::monostate> lookup(
         http_method method, std::string_view path) const noexcept;
 
+    // Returns a bitmask of methods registered for the given path.
+    // Bit i is set if http_method(i) has a handler at that path.
+    [[nodiscard]]
+    std::uint8_t methods_for_path(std::string_view path) const noexcept;
+
 private:
     struct trie_node;
 

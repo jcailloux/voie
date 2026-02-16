@@ -100,7 +100,7 @@ TEST_CASE("ctx: text response", "[ctx]") {
     REQUIRE(c.response_sent());
     REQUIRE(c.status_code() == 200);
     REQUIRE(c.resp_body() == "hello");
-    REQUIRE(c.resp_content_type() == "text/plain");
+    REQUIRE(c.resp_content_type() == "text/plain; charset=utf-8");
 }
 
 TEST_CASE("ctx: json response", "[ctx]") {
@@ -124,7 +124,7 @@ TEST_CASE("ctx: html response", "[ctx]") {
 
     c.html("<h1>Hi</h1>");
     REQUIRE(c.resp_body() == "<h1>Hi</h1>");
-    REQUIRE(c.resp_content_type() == "text/html");
+    REQUIRE(c.resp_content_type() == "text/html; charset=utf-8");
 }
 
 TEST_CASE("ctx: status code", "[ctx]") {
@@ -479,7 +479,7 @@ TEST_CASE("ctx: query with equals in value", "[ctx]") {
     route_match match{};
     ctx c(conn, tr.req, match);
 
-    REQUIRE(c.query("expr") == "a%3Db");
+    REQUIRE(c.query("expr") == "a=b");
 }
 
 TEST_CASE("ctx: no query string", "[ctx]") {
@@ -524,4 +524,126 @@ TEST_CASE("ctx: header case insensitive mixed case", "[ctx]") {
     REQUIRE(c.header("CONTENT-TYPE") == "text/html");
     REQUIRE(c.header("Content-Type") == "text/html");
     REQUIRE(c.header("Content-type") == "text/html");
+}
+
+// ============================================================================
+// no_content()
+// ============================================================================
+
+TEST_CASE("ctx: no_content() basic", "[ctx]") {
+    auto conn = make_conn();
+    const char raw[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto tr = make_request(raw, sizeof(raw) - 1);
+    route_match match{};
+    ctx c(conn, tr.req, match);
+
+    c.no_content();
+    REQUIRE(c.status_code() == 204);
+    REQUIRE(c.resp_body().empty());
+    REQUIRE(c.resp_content_type().empty());
+    REQUIRE(c.response_sent());
+}
+
+TEST_CASE("ctx: no_content() after send is no-op", "[ctx]") {
+    auto conn = make_conn();
+    const char raw[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto tr = make_request(raw, sizeof(raw) - 1);
+    route_match match{};
+    ctx c(conn, tr.req, match);
+
+    c.text("ok");
+    c.no_content();
+    REQUIRE(c.status_code() == 200);
+    REQUIRE(c.resp_body() == "ok");
+}
+
+// ============================================================================
+// request_header_count() / request_header_at()
+// ============================================================================
+
+TEST_CASE("ctx: request_header_count()", "[ctx]") {
+    auto conn = make_conn();
+    const char raw[] = "GET / HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nX-Foo: bar\r\n\r\n";
+    auto tr = make_request(raw, sizeof(raw) - 1);
+    route_match match{};
+    ctx c(conn, tr.req, match);
+
+    REQUIRE(c.request_header_count() == 3);
+}
+
+TEST_CASE("ctx: request_header_at() valid indices", "[ctx]") {
+    auto conn = make_conn();
+    const char raw[] = "GET / HTTP/1.1\r\nHost: localhost\r\nX-Foo: bar\r\n\r\n";
+    auto tr = make_request(raw, sizeof(raw) - 1);
+    route_match match{};
+    ctx c(conn, tr.req, match);
+
+    auto [name0, value0] = c.request_header_at(0);
+    REQUIRE(name0 == "Host");
+    REQUIRE(value0 == "localhost");
+
+    auto [name1, value1] = c.request_header_at(1);
+    REQUIRE(name1 == "X-Foo");
+    REQUIRE(value1 == "bar");
+}
+
+TEST_CASE("ctx: request_header_at() out of bounds", "[ctx]") {
+    auto conn = make_conn();
+    const char raw[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto tr = make_request(raw, sizeof(raw) - 1);
+    route_match match{};
+    ctx c(conn, tr.req, match);
+
+    auto [name, value] = c.request_header_at(99);
+    REQUIRE(name.empty());
+    REQUIRE(value.empty());
+}
+
+// ============================================================================
+// set() overwrite case-insensitive
+// ============================================================================
+
+TEST_CASE("ctx: set() overwrites case-insensitively", "[ctx]") {
+    auto conn = make_conn();
+    const char raw[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto tr = make_request(raw, sizeof(raw) - 1);
+    route_match match{};
+    ctx c(conn, tr.req, match);
+
+    c.set("X-Foo", "a");
+    c.set("x-foo", "b");
+    REQUIRE(c.resp_header_count() == 1);
+    REQUIRE(c.resp_headers()[0].value == "b");
+}
+
+// ============================================================================
+// query() edge cases with URL decoding
+// ============================================================================
+
+TEST_CASE("ctx: query() returns first occurrence for duplicate keys", "[ctx]") {
+    auto conn = make_conn();
+    const char raw[] = "GET /search?a=1&a=2 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto tr = make_request(raw, sizeof(raw) - 1);
+    route_match match{};
+    ctx c(conn, tr.req, match);
+
+    REQUIRE(c.query("a") == "1");
+}
+
+// ============================================================================
+// has_header()
+// ============================================================================
+
+TEST_CASE("ctx: has_header() case-insensitive", "[ctx]") {
+    auto conn = make_conn();
+    const char raw[] = "GET / HTTP/1.1\r\nContent-Type: text/html\r\nHost: localhost\r\n\r\n";
+    auto tr = make_request(raw, sizeof(raw) - 1);
+    route_match match{};
+    ctx c(conn, tr.req, match);
+
+    REQUIRE(c.has_header("Content-Type"));
+    REQUIRE(c.has_header("content-type"));
+    REQUIRE(c.has_header("CONTENT-TYPE"));
+    REQUIRE(c.has_header("Host"));
+    REQUIRE_FALSE(c.has_header("X-Missing"));
 }

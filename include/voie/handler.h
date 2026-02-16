@@ -46,9 +46,7 @@ public:
 
     ~handler() {
         if (destroy_) {
-            destroy_(heap_ ? buf_ : buf_);
-            // Always pass buf_ — the destroy lambda knows whether to interpret
-            // it as inline storage or as a pointer to heap storage.
+            destroy_(buf_);
         }
     }
 

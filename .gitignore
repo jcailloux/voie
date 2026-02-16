@@ -1,4 +1,9 @@
 .idea
 build/
+.build/
 cmake-build-*/
 compile_commands.json
+*.o
+*.a
+.cache/
+Testing/

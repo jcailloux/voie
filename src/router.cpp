@@ -278,4 +278,17 @@ bool router::search(const trie_node* node, std::string_view path,
     return false;
 }
 
+std::uint8_t router::methods_for_path(std::string_view path) const noexcept {
+    if (path.empty() || path[0] != '/') return 0;
+
+    std::uint8_t mask = 0;
+    for (int m = 0; m < http_method_count; ++m) {
+        route_match match{};
+        if (search(root_.get(), path.substr(1), static_cast<http_method>(m), match)) {
+            mask |= static_cast<std::uint8_t>(1u << m);
+        }
+    }
+    return mask;
+}
+
 } // namespace voie::detail
