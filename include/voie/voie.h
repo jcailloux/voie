@@ -12,9 +12,19 @@
 
 namespace voie {
 
-// Pre-build a complete HTTP response at startup.
-// At request time, the pre-built bytes are sent directly — no parsing,
-// no allocation, no build_response(). Ideal for static/benchmark routes.
+/// Build a complete HTTP response at startup for zero-copy serving.
+///
+/// The returned handler sends the pre-built bytes directly to the client,
+/// bypassing response construction entirely.  Ideal for static content
+/// or benchmark routes.
+///
+/// @code
+/// app.get("/health", voie::prebuilt("OK", "text/plain"));
+/// @endcode
+///
+/// @param body          Response body.
+/// @param content_type  MIME type (e.g. `"text/plain"`).
+/// @return A handler that sends the pre-built response.
 inline handler prebuilt(std::string_view body, std::string_view content_type) {
     std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: ";
     resp += content_type;

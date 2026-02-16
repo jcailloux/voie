@@ -113,7 +113,7 @@ static int connect_to(uint16_t port) {
         return -1;
     }
     struct timeval tv{};
-    tv.tv_sec = 2;
+    tv.tv_sec = 5;
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
 }
