@@ -1,6 +1,10 @@
 #include <voie/app.h>
 #include "router.h"
-#include "io_loop.h"
+#include "event_loop.h"
+#include "epoll_loop.h"
+#ifdef VOIE_HAS_IO_URING
+#include "uring_loop.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -21,16 +25,44 @@ struct app::impl {
     unsigned thread_count = 0;
     std::size_t max_body_size = 1 << 20;
     int listen_backlog = 512;
+    voie::backend backend = voie::backend::auto_detect;
     std::vector<middleware_fn> global_middleware;
     handler not_found_handler;
     std::function<void(ctx&, std::exception_ptr)> error_handler;
     group::impl group_impl;
     detail::app_config config;
-    std::vector<std::unique_ptr<detail::io_loop>> loops;
+    std::vector<std::unique_ptr<detail::event_loop>> loops;
     std::vector<std::thread> threads;
     std::atomic<unsigned> ready_count{0};
     std::atomic<unsigned> total_threads{0};
 };
+
+static voie::backend resolve_backend(voie::backend b) {
+    if (b != voie::backend::auto_detect) return b;
+#ifdef VOIE_HAS_IO_URING
+    if (app::backend_available(voie::backend::io_uring))
+        return voie::backend::io_uring;
+#endif
+    return voie::backend::epoll;
+}
+
+static std::unique_ptr<detail::event_loop>
+create_loop(voie::backend b,
+            const detail::router& router,
+            const detail::app_config& config,
+            const handler* not_found,
+            const std::function<void(ctx&, std::exception_ptr)>* error_handler) {
+    switch (b) {
+#ifdef VOIE_HAS_IO_URING
+        case voie::backend::io_uring:
+            return std::make_unique<detail::uring_loop>(router, config, not_found, error_handler);
+#endif
+        case voie::backend::epoll:
+            return std::make_unique<detail::epoll_loop>(router, config, not_found, error_handler);
+        default:
+            return std::make_unique<detail::epoll_loop>(router, config, not_found, error_handler);
+    }
+}
 
 app::app() : impl_(std::make_unique<impl>()) {}
 app::~app() {
@@ -48,6 +80,24 @@ app& app::sqpoll(bool enable) {
         ? detail::sqpoll_mode::on
         : detail::sqpoll_mode::off;
     return *this;
+}
+app& app::set_backend(voie::backend b) { impl_->backend = b; return *this; }
+
+bool app::backend_available(voie::backend b) {
+    switch (b) {
+        case voie::backend::epoll:
+            return true;
+        case voie::backend::io_uring: {
+#ifdef VOIE_HAS_IO_URING
+            return detail::uring_loop::probe();
+#else
+            return false;
+#endif
+        }
+        case voie::backend::auto_detect:
+            return true;
+    }
+    return false;
 }
 
 app& app::use(handler mw) {
@@ -95,16 +145,19 @@ void app::listen(std::string_view address, std::uint16_t port) {
         if (num_threads == 0) num_threads = 1;
     }
 
-    std::fprintf(stderr, "voie: listening on %.*s:%u (%u threads)\n",
-                 static_cast<int>(address.size()), address.data(), port, num_threads);
+    auto be = resolve_backend(impl_->backend);
+    const char* be_name = (be == voie::backend::io_uring) ? "io_uring" : "epoll";
+    std::fprintf(stderr, "voie: listening on %.*s:%u (%u threads, %s)\n",
+                 static_cast<int>(address.size()), address.data(), port,
+                 num_threads, be_name);
 
     impl_->total_threads.store(num_threads, std::memory_order_release);
 
-    // Create all io_loops (including single-thread — needed for shutdown())
+    // Create all event loops
     std::string addr_str{address};
     for (unsigned i = 0; i < num_threads; ++i) {
-        impl_->loops.push_back(std::make_unique<detail::io_loop>(
-            impl_->group_impl.router, impl_->config,
+        impl_->loops.push_back(create_loop(
+            be, impl_->group_impl.router, impl_->config,
             &impl_->not_found_handler, &impl_->error_handler));
     }
 
