@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `shutdown(SHUT_WR)` before async close to prevent response data loss under high load
+- io_uring SQE exhaustion: flush-and-retry with synchronous close fallback instead of silently dropping operations
 
 ## [0.1.0] - 2025-05-01
 

@@ -6,6 +6,7 @@
 #include <memory>
 
 struct io_uring;
+struct io_uring_sqe;
 
 namespace voie::detail {
 
@@ -40,6 +41,8 @@ private:
         std::uint32_t conn_id;
     };
 
+    ::io_uring_sqe* acquire_sqe();
+    void close_sync(std::uint32_t conn_id);
     void submit_accept();
     void submit_timeout();
     void handle_accept(int res, unsigned cqe_flags);

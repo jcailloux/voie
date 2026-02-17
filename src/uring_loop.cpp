@@ -27,10 +27,25 @@ bool uring_loop::probe() noexcept {
     return true;
 }
 
+::io_uring_sqe* uring_loop::acquire_sqe() {
+    auto* sqe = io_uring_get_sqe(ring_);
+    if (sqe) return sqe;
+    // SQ ring full — flush pending SQEs to the kernel and retry
+    io_uring_submit(ring_);
+    return io_uring_get_sqe(ring_);
+}
+
+void uring_loop::close_sync(std::uint32_t conn_id) {
+    auto& conn = *connections_[conn_id];
+    ::shutdown(conn.fd(), SHUT_WR);
+    ::close(conn.fd());
+    free_conn_id(conn_id);
+}
+
 void uring_loop::start_recv(std::uint32_t conn_id) {
     auto& conn = *connections_[conn_id];
-    auto* sqe = io_uring_get_sqe(ring_);
-    if (!sqe) return;
+    auto* sqe = acquire_sqe();
+    if (!sqe) { close_sync(conn_id); return; }
 
     char* buf = conn.recv_buf() + conn.recv_len();
     std::size_t remaining = conn.recv_capacity() - conn.recv_len();
@@ -42,8 +57,8 @@ void uring_loop::start_recv(std::uint32_t conn_id) {
 
 void uring_loop::start_send(std::uint32_t conn_id) {
     auto& conn = *connections_[conn_id];
-    auto* sqe = io_uring_get_sqe(ring_);
-    if (!sqe) return;
+    auto* sqe = acquire_sqe();
+    if (!sqe) { close_sync(conn_id); return; }
 
     const char* buf = conn.send_buf() + conn.send_offset();
     std::size_t len = conn.send_len() - conn.send_offset();
@@ -59,8 +74,13 @@ void uring_loop::start_close(std::uint32_t conn_id) {
     // Ensure pending send data is flushed before the async close
     ::shutdown(conn.fd(), SHUT_WR);
 
-    auto* sqe = io_uring_get_sqe(ring_);
-    if (!sqe) return;
+    auto* sqe = acquire_sqe();
+    if (!sqe) {
+        // Cannot queue async close — fall back to synchronous
+        ::close(conn.fd());
+        free_conn_id(conn_id);
+        return;
+    }
 
     io_uring_prep_close(sqe, conn.fd());
     event_store_[conn_id] = {event_type::close, conn_id};
@@ -72,7 +92,7 @@ void uring_loop::flush_io() {
 }
 
 void uring_loop::submit_accept() {
-    auto* sqe = io_uring_get_sqe(ring_);
+    auto* sqe = acquire_sqe();
     if (!sqe) return;
 
     io_uring_prep_multishot_accept(sqe, listen_fd_, nullptr, nullptr, 0);
@@ -81,7 +101,7 @@ void uring_loop::submit_accept() {
 }
 
 void uring_loop::submit_timeout() {
-    auto* sqe = io_uring_get_sqe(ring_);
+    auto* sqe = acquire_sqe();
     if (!sqe) return;
 
     struct __kernel_timespec ts = {.tv_sec = 5, .tv_nsec = 0};

@@ -271,11 +271,18 @@ TEST_CASE("integration: different HTTP methods", "[integration]") {
     srv.app.post("/res", [](voie::ctx& c) { c.text("posted"); });
     srv.start();
 
-    REQUIRE(http_get(port, "/res").body == "got");
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
 
-    auto resp = send_raw(port,
+    auto r1 = send_request(fd,
+        "GET /res HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    REQUIRE(r1.body == "got");
+
+    auto r2 = send_request(fd,
         "POST /res HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
-    REQUIRE(resp.body == "posted");
+    REQUIRE(r2.body == "posted");
+
+    ::close(fd);
 }
 
 // ============================================================================
@@ -617,34 +624,40 @@ TEST_CASE("integration: all() responds to multiple methods", "[integration]") {
     });
     srv.start();
 
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
     // GET
-    auto r1 = http_get(port, "/any");
+    auto r1 = send_request(fd,
+        "GET /any HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(r1.status == 200);
     REQUIRE(r1.body == "method:GET");
 
     // POST
-    auto r2 = send_raw(port,
+    auto r2 = send_request(fd,
         "POST /any HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
     REQUIRE(r2.status == 200);
     REQUIRE(r2.body == "method:POST");
 
     // PUT
-    auto r3 = send_raw(port,
+    auto r3 = send_request(fd,
         "PUT /any HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
     REQUIRE(r3.status == 200);
     REQUIRE(r3.body == "method:PUT");
 
     // DELETE
-    auto r4 = send_raw(port,
+    auto r4 = send_request(fd,
         "DELETE /any HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(r4.status == 200);
     REQUIRE(r4.body == "method:DELETE");
 
     // PATCH
-    auto r5 = send_raw(port,
+    auto r5 = send_request(fd,
         "PATCH /any HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
     REQUIRE(r5.status == 200);
     REQUIRE(r5.body == "method:PATCH");
+
+    ::close(fd);
 }
 
 // ============================================================================
@@ -669,6 +682,37 @@ TEST_CASE("integration: listen on specific address", "[integration]") {
     app.shutdown();
     wake_loops(port, 3);
     t.join();
+}
+
+// ============================================================================
+// max_body() enforcement
+// ============================================================================
+
+// ============================================================================
+// Rapid connection churn — stress test for SQE/fd cleanup
+// ============================================================================
+
+TEST_CASE("integration: rapid connection churn", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
+    auto port = alloc_port();
+    test_server srv(port, be);
+    srv.app.get("/churn", [](voie::ctx& c) { c.text("ok"); });
+    srv.start();
+
+    constexpr int ROUNDS = 50;
+    int success_count = 0;
+
+    for (int i = 0; i < ROUNDS; ++i) {
+        int fd = connect_to(port);
+        if (fd < 0) continue;
+        auto resp = send_request(fd,
+            "GET /churn HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        ::close(fd);
+        if (resp.status == 200 && resp.body == "ok")
+            ++success_count;
+    }
+
+    REQUIRE(success_count == ROUNDS);
 }
 
 // ============================================================================
