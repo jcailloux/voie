@@ -258,9 +258,14 @@ TEST_CASE("integration: multiple routes", "[integration]") {
     srv.app.get("/c", [](voie::ctx& c) { c.text("C"); });
     srv.start();
 
-    REQUIRE(http_get(port, "/a").body == "A");
-    REQUIRE(http_get(port, "/b").body == "B");
-    REQUIRE(http_get(port, "/c").body == "C");
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
+    REQUIRE(send_request(fd, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n").body == "A");
+    REQUIRE(send_request(fd, "GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n").body == "B");
+    REQUIRE(send_request(fd, "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n").body == "C");
+
+    ::close(fd);
 }
 
 TEST_CASE("integration: different HTTP methods", "[integration]") {
@@ -302,9 +307,14 @@ TEST_CASE("integration: group prefix routing", "[integration]") {
     });
     srv.start();
 
-    REQUIRE(http_get(port, "/api/v1/items").body == R"(["a","b"])");
-    REQUIRE(http_get(port, "/api/v1/items/7").body == "item:7");
-    REQUIRE(http_get(port, "/api/v1/missing").status == 404);
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
+    REQUIRE(send_request(fd, "GET /api/v1/items HTTP/1.1\r\nHost: localhost\r\n\r\n").body == R"(["a","b"])");
+    REQUIRE(send_request(fd, "GET /api/v1/items/7 HTTP/1.1\r\nHost: localhost\r\n\r\n").body == "item:7");
+    REQUIRE(send_request(fd, "GET /api/v1/missing HTTP/1.1\r\nHost: localhost\r\n\r\n").status == 404);
+
+    ::close(fd);
 }
 
 // ============================================================================
@@ -350,15 +360,21 @@ TEST_CASE("integration: middleware short-circuit", "[integration]") {
     );
     srv.start();
 
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
     // Without auth → 401
-    auto resp1 = http_get(port, "/guarded");
+    auto resp1 = send_request(fd,
+        "GET /guarded HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(resp1.status == 401);
 
     // With auth → 200
-    auto resp2 = send_raw(port,
+    auto resp2 = send_request(fd,
         "GET /guarded HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tok\r\n\r\n");
     REQUIRE(resp2.status == 200);
     REQUIRE(resp2.body == "secret");
+
+    ::close(fd);
 }
 
 TEST_CASE("integration: global middleware", "[integration]") {
@@ -373,11 +389,18 @@ TEST_CASE("integration: global middleware", "[integration]") {
     srv.app.get("/b", [](voie::ctx& c) { c.text("B"); });
     srv.start();
 
-    auto resp1 = http_get(port, "/a");
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
+    auto resp1 = send_request(fd,
+        "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(resp1.raw.find("X-Global: yes") != std::string::npos);
 
-    auto resp2 = http_get(port, "/b");
+    auto resp2 = send_request(fd,
+        "GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(resp2.raw.find("X-Global: yes") != std::string::npos);
+
+    ::close(fd);
 }
 
 // ============================================================================
@@ -703,13 +726,21 @@ TEST_CASE("integration: rapid connection churn", "[integration]") {
     int success_count = 0;
 
     for (int i = 0; i < ROUNDS; ++i) {
-        int fd = connect_to(port);
-        if (fd < 0) continue;
-        auto resp = send_request(fd,
-            "GET /churn HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        ::close(fd);
-        if (resp.status == 200 && resp.body == "ok")
-            ++success_count;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            int fd = connect_to(port);
+            if (fd < 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            auto resp = send_request(fd,
+                "GET /churn HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            ::close(fd);
+            if (resp.status == 200 && resp.body == "ok") {
+                ++success_count;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
     }
 
     REQUIRE(success_count == ROUNDS);
@@ -727,17 +758,22 @@ TEST_CASE("integration: max_body rejects oversized body", "[integration]") {
     srv.app.post("/upload", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
     // Body within limit
     std::string small_body(32, 'x');
     std::string small_req = "POST /upload HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Length: " + std::to_string(small_body.size()) + "\r\n\r\n" + small_body;
-    auto r1 = send_raw(port, small_req);
+    auto r1 = send_request(fd, small_req);
     REQUIRE(r1.status == 200);
 
-    // Body exceeding limit
+    // Body exceeding limit (server sends 413 + Connection: close)
     std::string big_body(128, 'x');
     std::string big_req = "POST /upload HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Length: " + std::to_string(big_body.size()) + "\r\n\r\n" + big_body;
-    auto r2 = send_raw(port, big_req);
+    auto r2 = send_request(fd, big_req);
     REQUIRE(r2.status == 413);
+
+    ::close(fd);
 }

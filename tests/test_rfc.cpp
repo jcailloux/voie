@@ -313,13 +313,20 @@ TEST_CASE("rfc: charset appended for text/* content types", "[rfc]") {
     srv.app.get("/json", [](voie::ctx& c) { c.json("{}"); });
     srv.start();
 
-    auto text_resp = http_get(port, "/text");
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
+    auto text_resp = send_request(fd,
+        "GET /text HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(text_resp.raw.find("text/plain; charset=utf-8") != std::string::npos);
 
-    auto json_resp = http_get(port, "/json");
+    auto json_resp = send_request(fd,
+        "GET /json HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(json_resp.raw.find("application/json") != std::string::npos);
     // application/json should NOT have charset appended
     REQUIRE(json_resp.raw.find("application/json; charset") == std::string::npos);
+
+    ::close(fd);
 }
 
 // ============================================================================
