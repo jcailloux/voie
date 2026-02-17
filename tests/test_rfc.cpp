@@ -219,32 +219,12 @@ TEST_CASE("rfc: HEAD returns GET headers without body", "[rfc]") {
     srv.app.get("/data", [](voie::ctx& c) { c.text("hello world"); });
     srv.start();
 
-    int fd = connect_to(port);
-    REQUIRE(fd >= 0);
-    const char req[] = "HEAD /data HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    ::send(fd, req, sizeof(req) - 1, MSG_NOSIGNAL);
-
-    http_response resp;
-    char buf[4096];
-    while (true) {
-        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-        resp.raw.append(buf, static_cast<std::size_t>(n));
-    }
-    ::close(fd);
-
-    if (resp.raw.size() >= 12) {
-        int s = 0;
-        bool valid = true;
-        for (int i = 9; i < 12; ++i) {
-            if (resp.raw[i] < '0' || resp.raw[i] > '9') { valid = false; break; }
-            s = s * 10 + (resp.raw[i] - '0');
-        }
-        if (valid) resp.status = s;
-    }
-
+    auto resp = send_raw(port,
+        "HEAD /data HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     REQUIRE(resp.status == 200);
     REQUIRE(resp.raw.find("Content-Length: 11") != std::string::npos);
+    REQUIRE(resp.body.empty());
+    // Verify no body data was sent after headers
     auto hdr_end = resp.raw.find("\r\n\r\n");
     REQUIRE(hdr_end != std::string::npos);
     REQUIRE(resp.raw.size() == hdr_end + 4);
