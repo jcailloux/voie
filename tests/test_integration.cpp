@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <voie/voie.h>
 
 #include <arpa/inet.h>
@@ -149,8 +150,9 @@ struct test_server {
     std::thread thread;
     uint16_t port;
 
-    explicit test_server(uint16_t p) : port(p) {
+    explicit test_server(uint16_t p, voie::backend be = voie::backend::auto_detect) : port(p) {
         app.threads(2);
+        app.set_backend(be);
     }
 
     void start() {
@@ -166,12 +168,22 @@ struct test_server {
 };
 
 // ============================================================================
+// Backend parametrization
+// ============================================================================
+
+#define BACKEND_TEST_PREAMBLE \
+    auto be = GENERATE(voie::backend::io_uring, voie::backend::epoll); \
+    if (!voie::app::backend_available(be)) SKIP("Backend not available"); \
+    CAPTURE(be)
+
+// ============================================================================
 // Basic request-response
 // ============================================================================
 
 TEST_CASE("integration: GET text response", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/hello", [](voie::ctx& c) { c.text("hello, world"); });
     srv.start();
 
@@ -182,8 +194,9 @@ TEST_CASE("integration: GET text response", "[integration]") {
 }
 
 TEST_CASE("integration: GET json response", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/data", [](voie::ctx& c) { c.json(R"({"ok":true})"); });
     srv.start();
 
@@ -194,8 +207,9 @@ TEST_CASE("integration: GET json response", "[integration]") {
 }
 
 TEST_CASE("integration: prebuilt response", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/fast", voie::prebuilt("prebuilt!", "text/plain"));
     srv.start();
 
@@ -205,8 +219,9 @@ TEST_CASE("integration: prebuilt response", "[integration]") {
 }
 
 TEST_CASE("integration: custom status code", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/created", [](voie::ctx& c) { c.status(201).json(R"({"id":1})"); });
     srv.start();
 
@@ -219,8 +234,9 @@ TEST_CASE("integration: custom status code", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: route parameters", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/users/:id", [](voie::ctx& c) {
         std::string body = "user:";
         body += c.param("id");
@@ -234,30 +250,44 @@ TEST_CASE("integration: route parameters", "[integration]") {
 }
 
 TEST_CASE("integration: multiple routes", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/a", [](voie::ctx& c) { c.text("A"); });
     srv.app.get("/b", [](voie::ctx& c) { c.text("B"); });
     srv.app.get("/c", [](voie::ctx& c) { c.text("C"); });
     srv.start();
 
-    REQUIRE(http_get(port, "/a").body == "A");
-    REQUIRE(http_get(port, "/b").body == "B");
-    REQUIRE(http_get(port, "/c").body == "C");
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
+    REQUIRE(send_request(fd, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n").body == "A");
+    REQUIRE(send_request(fd, "GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n").body == "B");
+    REQUIRE(send_request(fd, "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n").body == "C");
+
+    ::close(fd);
 }
 
 TEST_CASE("integration: different HTTP methods", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/res", [](voie::ctx& c) { c.text("got"); });
     srv.app.post("/res", [](voie::ctx& c) { c.text("posted"); });
     srv.start();
 
-    REQUIRE(http_get(port, "/res").body == "got");
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
 
-    auto resp = send_raw(port,
+    auto r1 = send_request(fd,
+        "GET /res HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    REQUIRE(r1.body == "got");
+
+    auto r2 = send_request(fd,
         "POST /res HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
-    REQUIRE(resp.body == "posted");
+    REQUIRE(r2.body == "posted");
+
+    ::close(fd);
 }
 
 // ============================================================================
@@ -265,8 +295,9 @@ TEST_CASE("integration: different HTTP methods", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: group prefix routing", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     auto api = srv.app.group("/api/v1");
     api.get("/items", [](voie::ctx& c) { c.json(R"(["a","b"])"); });
     api.get("/items/:id", [](voie::ctx& c) {
@@ -276,9 +307,14 @@ TEST_CASE("integration: group prefix routing", "[integration]") {
     });
     srv.start();
 
-    REQUIRE(http_get(port, "/api/v1/items").body == R"(["a","b"])");
-    REQUIRE(http_get(port, "/api/v1/items/7").body == "item:7");
-    REQUIRE(http_get(port, "/api/v1/missing").status == 404);
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
+    REQUIRE(send_request(fd, "GET /api/v1/items HTTP/1.1\r\nHost: localhost\r\n\r\n").body == R"(["a","b"])");
+    REQUIRE(send_request(fd, "GET /api/v1/items/7 HTTP/1.1\r\nHost: localhost\r\n\r\n").body == "item:7");
+    REQUIRE(send_request(fd, "GET /api/v1/missing HTTP/1.1\r\nHost: localhost\r\n\r\n").status == 404);
+
+    ::close(fd);
 }
 
 // ============================================================================
@@ -286,8 +322,9 @@ TEST_CASE("integration: group prefix routing", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: middleware chain", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/chain",
         [](voie::ctx& c) {
             c.set("X-Step", "1");
@@ -306,8 +343,9 @@ TEST_CASE("integration: middleware chain", "[integration]") {
 }
 
 TEST_CASE("integration: middleware short-circuit", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/guarded",
         [](voie::ctx& c) {
             if (c.header("Authorization").empty()) {
@@ -322,20 +360,27 @@ TEST_CASE("integration: middleware short-circuit", "[integration]") {
     );
     srv.start();
 
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
     // Without auth → 401
-    auto resp1 = http_get(port, "/guarded");
+    auto resp1 = send_request(fd,
+        "GET /guarded HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(resp1.status == 401);
 
     // With auth → 200
-    auto resp2 = send_raw(port,
+    auto resp2 = send_request(fd,
         "GET /guarded HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tok\r\n\r\n");
     REQUIRE(resp2.status == 200);
     REQUIRE(resp2.body == "secret");
+
+    ::close(fd);
 }
 
 TEST_CASE("integration: global middleware", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.use([](voie::ctx& c) {
         c.set("X-Global", "yes");
         c.next();
@@ -344,11 +389,18 @@ TEST_CASE("integration: global middleware", "[integration]") {
     srv.app.get("/b", [](voie::ctx& c) { c.text("B"); });
     srv.start();
 
-    auto resp1 = http_get(port, "/a");
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
+    auto resp1 = send_request(fd,
+        "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(resp1.raw.find("X-Global: yes") != std::string::npos);
 
-    auto resp2 = http_get(port, "/b");
+    auto resp2 = send_request(fd,
+        "GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(resp2.raw.find("X-Global: yes") != std::string::npos);
+
+    ::close(fd);
 }
 
 // ============================================================================
@@ -356,8 +408,9 @@ TEST_CASE("integration: global middleware", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: 404 default", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/exists", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
@@ -366,8 +419,9 @@ TEST_CASE("integration: 404 default", "[integration]") {
 }
 
 TEST_CASE("integration: custom 404 handler", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/exists", [](voie::ctx& c) { c.text("ok"); });
     srv.app.not_found([](voie::ctx& c) {
         c.status(404).json(R"({"error":"not found"})");
@@ -380,8 +434,9 @@ TEST_CASE("integration: custom 404 handler", "[integration]") {
 }
 
 TEST_CASE("integration: error handler catches exceptions", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/boom", [](voie::ctx& c) {
         throw std::runtime_error("test error");
     });
@@ -396,8 +451,9 @@ TEST_CASE("integration: error handler catches exceptions", "[integration]") {
 }
 
 TEST_CASE("integration: malformed request gets 400", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
@@ -410,8 +466,9 @@ TEST_CASE("integration: malformed request gets 400", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: keep-alive multiple requests on one connection", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/ping", [](voie::ctx& c) { c.text("pong"); });
     srv.start();
 
@@ -432,8 +489,9 @@ TEST_CASE("integration: keep-alive multiple requests on one connection", "[integ
 // ============================================================================
 
 TEST_CASE("integration: concurrent connections", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/concurrent", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
@@ -461,8 +519,9 @@ TEST_CASE("integration: concurrent connections", "[integration]") {
 }
 
 TEST_CASE("integration: concurrent keep-alive connections", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/ka", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
@@ -500,8 +559,9 @@ TEST_CASE("integration: concurrent keep-alive connections", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: POST with body echo", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.post("/echo", [](voie::ctx& c) {
         c.text(c.body());
     });
@@ -520,8 +580,9 @@ TEST_CASE("integration: POST with body echo", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: redirect response", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/old", [](voie::ctx& c) { c.redirect("/new", 301); });
     srv.start();
 
@@ -535,8 +596,9 @@ TEST_CASE("integration: redirect response", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: query string parameters", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/search", [](voie::ctx& c) {
         std::string result = "q=";
         result += c.query("q");
@@ -554,8 +616,9 @@ TEST_CASE("integration: query string parameters", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: custom response headers", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/headers", [](voie::ctx& c) {
         c.set("X-Custom", "myvalue");
         c.set("X-Request-Id", "abc-123");
@@ -574,8 +637,9 @@ TEST_CASE("integration: custom response headers", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: all() responds to multiple methods", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.all("/any", [](voie::ctx& c) {
         std::string body = "method:";
         body += c.method();
@@ -583,34 +647,40 @@ TEST_CASE("integration: all() responds to multiple methods", "[integration]") {
     });
     srv.start();
 
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
     // GET
-    auto r1 = http_get(port, "/any");
+    auto r1 = send_request(fd,
+        "GET /any HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(r1.status == 200);
     REQUIRE(r1.body == "method:GET");
 
     // POST
-    auto r2 = send_raw(port,
+    auto r2 = send_request(fd,
         "POST /any HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
     REQUIRE(r2.status == 200);
     REQUIRE(r2.body == "method:POST");
 
     // PUT
-    auto r3 = send_raw(port,
+    auto r3 = send_request(fd,
         "PUT /any HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
     REQUIRE(r3.status == 200);
     REQUIRE(r3.body == "method:PUT");
 
     // DELETE
-    auto r4 = send_raw(port,
+    auto r4 = send_request(fd,
         "DELETE /any HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(r4.status == 200);
     REQUIRE(r4.body == "method:DELETE");
 
     // PATCH
-    auto r5 = send_raw(port,
+    auto r5 = send_request(fd,
         "PATCH /any HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
     REQUIRE(r5.status == 200);
     REQUIRE(r5.body == "method:PATCH");
+
+    ::close(fd);
 }
 
 // ============================================================================
@@ -618,9 +688,11 @@ TEST_CASE("integration: all() responds to multiple methods", "[integration]") {
 // ============================================================================
 
 TEST_CASE("integration: listen on specific address", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
     voie::app app;
     app.threads(1);
+    app.set_backend(be);
     app.get("/addr", [](voie::ctx& c) { c.text("bound"); });
 
     std::thread t([&]() { app.listen("127.0.0.1", port); });
@@ -639,24 +711,69 @@ TEST_CASE("integration: listen on specific address", "[integration]") {
 // max_body() enforcement
 // ============================================================================
 
-TEST_CASE("integration: max_body rejects oversized body", "[integration]") {
+// ============================================================================
+// Rapid connection churn — stress test for SQE/fd cleanup
+// ============================================================================
+
+TEST_CASE("integration: rapid connection churn", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
+    srv.app.get("/churn", [](voie::ctx& c) { c.text("ok"); });
+    srv.start();
+
+    constexpr int ROUNDS = 50;
+    int success_count = 0;
+
+    for (int i = 0; i < ROUNDS; ++i) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            int fd = connect_to(port);
+            if (fd < 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            auto resp = send_request(fd,
+                "GET /churn HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            ::close(fd);
+            if (resp.status == 200 && resp.body == "ok") {
+                ++success_count;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+
+    REQUIRE(success_count == ROUNDS);
+}
+
+// ============================================================================
+// max_body() enforcement
+// ============================================================================
+
+TEST_CASE("integration: max_body rejects oversized body", "[integration]") {
+    BACKEND_TEST_PREAMBLE;
+    auto port = alloc_port();
+    test_server srv(port, be);
     srv.app.max_body(64);
     srv.app.post("/upload", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
+
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
 
     // Body within limit
     std::string small_body(32, 'x');
     std::string small_req = "POST /upload HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Length: " + std::to_string(small_body.size()) + "\r\n\r\n" + small_body;
-    auto r1 = send_raw(port, small_req);
+    auto r1 = send_request(fd, small_req);
     REQUIRE(r1.status == 200);
 
-    // Body exceeding limit
+    // Body exceeding limit (server sends 413 + Connection: close)
     std::string big_body(128, 'x');
     std::string big_req = "POST /upload HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Length: " + std::to_string(big_body.size()) + "\r\n\r\n" + big_body;
-    auto r2 = send_raw(port, big_req);
+    auto r2 = send_request(fd, big_req);
     REQUIRE(r2.status == 413);
+
+    ::close(fd);
 }

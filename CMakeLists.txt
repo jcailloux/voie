@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(voie VERSION 0.1.0 LANGUAGES CXX C)
+project(voie VERSION 0.2.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,7 +16,8 @@ add_library(voie
     src/app.cpp
     src/ctx.cpp
     src/router.cpp
-    src/io_loop.cpp
+    src/event_loop.cpp
+    src/epoll_loop.cpp
     src/connection.cpp
     src/http_parser.cpp
     src/handler.cpp
@@ -33,8 +34,14 @@ target_include_directories(voie
 target_link_libraries(voie
     PRIVATE
         picohttpparser
-        uring
 )
+
+# io_uring backend (optional — adds uring_loop.cpp when liburing is available)
+if(URING_FOUND)
+    target_sources(voie PRIVATE src/uring_loop.cpp)
+    target_link_libraries(voie PRIVATE uring)
+    target_compile_definitions(voie PRIVATE VOIE_HAS_IO_URING)
+endif()
 
 target_compile_options(voie PRIVATE
     -Wall -Wextra -Wpedantic

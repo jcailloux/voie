@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <voie/voie.h>
 
 #include <arpa/inet.h>
@@ -137,8 +138,9 @@ struct test_server {
     std::thread thread;
     uint16_t port;
 
-    explicit test_server(uint16_t p) : port(p) {
+    explicit test_server(uint16_t p, voie::backend be = voie::backend::auto_detect) : port(p) {
         app.threads(2);
+        app.set_backend(be);
     }
 
     void start() {
@@ -154,12 +156,22 @@ struct test_server {
 };
 
 // ============================================================================
+// Backend parametrization
+// ============================================================================
+
+#define BACKEND_TEST_PREAMBLE \
+    auto be = GENERATE(voie::backend::io_uring, voie::backend::epoll); \
+    if (!voie::app::backend_available(be)) SKIP("Backend not available"); \
+    CAPTURE(be)
+
+// ============================================================================
 // RFC 7231 section 7.1.1.2 — Date header
 // ============================================================================
 
 TEST_CASE("rfc: Date header present in response", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
@@ -173,8 +185,9 @@ TEST_CASE("rfc: Date header present in response", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: Content-Length present in response with body", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
@@ -183,8 +196,9 @@ TEST_CASE("rfc: Content-Length present in response with body", "[rfc]") {
 }
 
 TEST_CASE("rfc: 204 response has no Content-Length", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/empty", [](voie::ctx& c) { c.no_content(); });
     srv.start();
 
@@ -199,37 +213,18 @@ TEST_CASE("rfc: 204 response has no Content-Length", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: HEAD returns GET headers without body", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/data", [](voie::ctx& c) { c.text("hello world"); });
     srv.start();
 
-    int fd = connect_to(port);
-    REQUIRE(fd >= 0);
-    const char req[] = "HEAD /data HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    ::send(fd, req, sizeof(req) - 1, MSG_NOSIGNAL);
-
-    http_response resp;
-    char buf[4096];
-    while (true) {
-        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-        resp.raw.append(buf, static_cast<std::size_t>(n));
-    }
-    ::close(fd);
-
-    if (resp.raw.size() >= 12) {
-        int s = 0;
-        bool valid = true;
-        for (int i = 9; i < 12; ++i) {
-            if (resp.raw[i] < '0' || resp.raw[i] > '9') { valid = false; break; }
-            s = s * 10 + (resp.raw[i] - '0');
-        }
-        if (valid) resp.status = s;
-    }
-
+    auto resp = send_raw(port,
+        "HEAD /data HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     REQUIRE(resp.status == 200);
     REQUIRE(resp.raw.find("Content-Length: 11") != std::string::npos);
+    REQUIRE(resp.body.empty());
+    // Verify no body data was sent after headers
     auto hdr_end = resp.raw.find("\r\n\r\n");
     REQUIRE(hdr_end != std::string::npos);
     REQUIRE(resp.raw.size() == hdr_end + 4);
@@ -240,8 +235,9 @@ TEST_CASE("rfc: HEAD returns GET headers without body", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: OPTIONS auto-response with Allow header", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/resource", [](voie::ctx& c) { c.text("get"); });
     srv.app.post("/resource", [](voie::ctx& c) { c.text("post"); });
     srv.start();
@@ -259,8 +255,9 @@ TEST_CASE("rfc: OPTIONS auto-response with Allow header", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: 501 for unknown HTTP method", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
@@ -274,8 +271,9 @@ TEST_CASE("rfc: 501 for unknown HTTP method", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: status line format", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/", [](voie::ctx& c) { c.text("ok"); });
     srv.start();
 
@@ -288,19 +286,27 @@ TEST_CASE("rfc: status line format", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: charset appended for text/* content types", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/text", [](voie::ctx& c) { c.text("hello"); });
     srv.app.get("/json", [](voie::ctx& c) { c.json("{}"); });
     srv.start();
 
-    auto text_resp = http_get(port, "/text");
+    int fd = connect_to(port);
+    REQUIRE(fd >= 0);
+
+    auto text_resp = send_request(fd,
+        "GET /text HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(text_resp.raw.find("text/plain; charset=utf-8") != std::string::npos);
 
-    auto json_resp = http_get(port, "/json");
+    auto json_resp = send_request(fd,
+        "GET /json HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(json_resp.raw.find("application/json") != std::string::npos);
     // application/json should NOT have charset appended
     REQUIRE(json_resp.raw.find("application/json; charset") == std::string::npos);
+
+    ::close(fd);
 }
 
 // ============================================================================
@@ -308,8 +314,9 @@ TEST_CASE("rfc: charset appended for text/* content types", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: URL-decoded route parameters", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/users/:name", [](voie::ctx& c) {
         c.text(c.param("name"));
     });
@@ -321,8 +328,9 @@ TEST_CASE("rfc: URL-decoded route parameters", "[rfc]") {
 }
 
 TEST_CASE("rfc: URL-decoded query parameters", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/search", [](voie::ctx& c) {
         c.text(c.query("q"));
     });
@@ -338,8 +346,9 @@ TEST_CASE("rfc: URL-decoded query parameters", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: has_header distinguishes empty from absent", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/check", [](voie::ctx& c) {
         bool has_x = c.has_header("X-Empty");
         bool has_missing = c.has_header("X-Missing");
@@ -362,8 +371,9 @@ TEST_CASE("rfc: has_header distinguishes empty from absent", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: pipelining two requests", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/a", [](voie::ctx& c) { c.text("A"); });
     srv.app.get("/b", [](voie::ctx& c) { c.text("B"); });
     srv.start();
@@ -396,8 +406,9 @@ TEST_CASE("rfc: pipelining two requests", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: Connection close is respected", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/hello", [](voie::ctx& c) { c.text("hi"); });
     srv.start();
 
@@ -419,8 +430,9 @@ TEST_CASE("rfc: Connection close is respected", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: HTTP/1.0 closes connection by default", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/hello", [](voie::ctx& c) { c.text("hi"); });
     srv.start();
 
@@ -441,8 +453,9 @@ TEST_CASE("rfc: HTTP/1.0 closes connection by default", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: Host header required in HTTP/1.1", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/hello", [](voie::ctx& c) { c.text("hi"); });
     srv.start();
 
@@ -456,8 +469,9 @@ TEST_CASE("rfc: Host header required in HTTP/1.1", "[rfc]") {
 // ============================================================================
 
 TEST_CASE("rfc: method is case-sensitive", "[rfc]") {
+    BACKEND_TEST_PREAMBLE;
     auto port = alloc_port();
-    test_server srv(port);
+    test_server srv(port, be);
     srv.app.get("/hello", [](voie::ctx& c) { c.text("hi"); });
     srv.start();
 

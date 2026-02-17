@@ -14,6 +14,13 @@ namespace voie {
 
 class ctx;
 
+/// I/O backend used by the event loop.
+enum class backend : std::uint8_t {
+    auto_detect,  ///< io_uring if available, epoll otherwise
+    io_uring,     ///< Linux io_uring (kernel 5.19+)
+    epoll,        ///< Linux epoll (always available)
+};
+
 /// HTTP server application.
 ///
 /// Central object that owns configuration, routes, middleware, and the
@@ -63,10 +70,20 @@ public:
     /// Enable or disable io_uring `SQPOLL` mode.
     /// When enabled the kernel polls the submission queue from a dedicated
     /// thread, reducing syscall overhead at the cost of one busy CPU core.
-    /// Default: off.
+    /// Ignored when the epoll backend is active.  Default: off.
     /// @param enable  `true` to enable, `false` to disable.
     /// @return `*this` for chaining.
     app& sqpoll(bool enable);
+
+    /// Select the I/O backend.
+    /// Default: `backend::auto_detect` (io_uring if available, epoll otherwise).
+    /// @param b  The backend to use.
+    /// @return `*this` for chaining.
+    app& set_backend(voie::backend b);
+
+    /// Check whether a specific backend is available at runtime.
+    /// Useful in tests to SKIP when io_uring is unavailable (e.g. Docker).
+    [[nodiscard]] static bool backend_available(voie::backend b);
 
     // -- Route registration --------------------------------------------------
 

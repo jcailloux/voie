@@ -22,11 +22,10 @@ endif()
 
 if(URING_FOUND)
     add_library(uring ALIAS PkgConfig::URING)
-    message(STATUS "Using system liburing: ${URING_VERSION}")
+    message(STATUS "Using system liburing: ${URING_VERSION} — io_uring backend enabled")
 else()
-    message(FATAL_ERROR
-        "liburing not found. Install it:\n"
-        "  Fedora: sudo dnf install liburing-devel\n"
-        "  Debian/Ubuntu: sudo apt install liburing-dev\n"
-    )
+    message(STATUS "liburing not found — io_uring backend disabled, using epoll only")
+    message(STATUS "  To enable io_uring, install liburing:")
+    message(STATUS "    Fedora: sudo dnf install liburing-devel")
+    message(STATUS "    Debian/Ubuntu: sudo apt install liburing-dev")
 endif()
